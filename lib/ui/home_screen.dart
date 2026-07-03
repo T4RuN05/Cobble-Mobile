@@ -25,7 +25,39 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _loadTags();
-    _syncWithCloud();
+    _loadLocalFiles().then((_) => _syncWithCloud());
+  }
+
+  Future<void> _loadLocalFiles() async {
+    try {
+      final dirPath = await StorageService.getStorageDirectory();
+      final dir = Directory(dirPath);
+      if (!dir.existsSync()) return;
+      
+      final localEntities = dir.listSync(recursive: true);
+      final List<Map<String, dynamic>> localFilesList = [];
+      
+      for (final entity in localEntities) {
+        if (entity is File && entity.path.endsWith('.xopp')) {
+          String filename = entity.path.substring(dir.path.length + 1).replaceAll('\\', '/');
+          if (filename.startsWith('.') || filename.contains('/.') || filename.contains('.autosave')) {
+            continue;
+          }
+          final lastMod = await entity.lastModified();
+          localFilesList.add({
+            'filename': filename,
+            'last_updated': lastMod.toIso8601String(),
+          });
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _files = localFilesList;
+        });
+      }
+    } catch (e) {
+      // Ignore local read errors
+    }
   }
 
   Future<void> _loadTags() async {

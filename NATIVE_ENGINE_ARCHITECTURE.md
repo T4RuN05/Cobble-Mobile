@@ -28,7 +28,28 @@ Meanwhile, Xournal++'s C++ engine has spent **years** perfecting its stroke pipe
 
 ---
 
-## 2. Architecture Decision: Why `dart:ffi` + Shared Memory Buffer
+## 2. Comparative Analysis: Why the Official `xournalpp_mobile` App Lags
+
+The official `xournalpp_mobile` repository (also built in Flutter) attempts to solve this problem using pure Dart. However, it suffers from severe performance degradation and high latency on Android devices. An architectural analysis of their codebase reveals several critical bottlenecks that our native C++ approach specifically solves:
+
+### 2.1 The "Widget-Per-Stroke" Anti-Pattern
+In `xournalpp_mobile`, the canvas is constructed using an `XppPageStack` which loops through every stroke and creates a separate `Positioned` widget containing a `CustomPaint` widget for it (see `XppLayerStack.dart` and `XppStroke.dart`). 
+- **The Problem:** If a user writes a page of notes (e.g., 1,000 individual strokes), Flutter has to maintain 1,000 `CustomPaint` widgets in its render tree. This completely overwhelms Flutter's layout and composite phases, leading to dramatic frame drops when zooming, panning, or rendering.
+- **Our Solution:** The C++ engine renders *all* strokes onto a single in-memory Cairo pixel buffer. Flutter only ever renders **one** widget (a `Texture` or `RawImage`), maintaining a flat, O(1) widget tree regardless of how much ink is on the page.
+
+### 2.2 Naive Pressure Rendering
+In `XppStrokePainter.dart`, the official app tries to render pressure by looping over every single point in the stroke. It creates a brand new `Path` and `Paint` object for the tiny segment between point `i-1` and `i`, explicitly setting the `strokeWidth` for just that segment.
+- **The Problem:** Allocating thousands of `Paint` objects and dispatching thousands of individual `Canvas.drawPath` calls per frame is exceptionally slow. Furthermore, it produces visually ugly, jagged "sausage link" strokes because it draws discrete line segments rather than calculating a smooth contour.
+- **Our Solution:** The C++ `StrokeContour` algorithm computes a mathematically smooth polygon boundary that encapsulates the varying pressure across the entire stroke, then issues a single highly-optimized `cairo_fill()` command.
+
+### 2.3 Main-Thread CPU Bottlenecks
+The official app parses `.xopp` XML files (which can be megabytes in size) and calculates eraser intersections (`XppStroke.eraseWhere`) using pure Dart on the main UI thread. 
+- **The Problem:** When erasing, `filterEraser()` iterates through every point of every stroke in the document on the main thread to perform radial intersection tests. This causes severe stuttering and unresponsive UI.
+- **Our Solution:** The C++ engine handles all intersection math natively in a highly optimized way (using spatial caching and SIMD), keeping the heavy computational load off Flutter's UI isolate.
+
+---
+
+## 3. Architecture Decision: Why `dart:ffi` + Shared Memory Buffer
 
 After evaluating all viable approaches, here is the verdict:
 
@@ -51,7 +72,7 @@ After evaluating all viable approaches, here is the verdict:
 
 ---
 
-## 3. High-Level System Architecture
+## 4. High-Level System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -115,9 +136,9 @@ After evaluating all viable approaches, here is the verdict:
 
 ---
 
-## 4. What Exactly Gets Ported from Xournal++
+## 5. What Exactly Gets Ported from Xournal++
 
-### 4.1 Files to Extract (Zero GTK Dependencies)
+### 5.1 Files to Extract (Zero GTK Dependencies)
 
 The following files from `src/core/` can be extracted almost verbatim because they are pure math/data with no GTK or UI dependencies:
 
@@ -132,7 +153,7 @@ model/Element.h             model/Element.cpp
 model/PathParameter.h
 ```
 
-### 4.2 Files Requiring Modification
+### 5.2 Files Requiring Modification
 
 These files have GTK/GLib/Settings dependencies that must be stripped:
 
@@ -144,7 +165,7 @@ These files have GTK/GLib/Settings dependencies that must be stripped:
 | `StrokeView.cpp` | Mask system, highlighter blending | Core `draw()` flow for pressure/no-pressure paths |
 | `ErasableStrokeView.cpp` | Nothing significant | Eraser rendering logic |
 
-### 4.3 External Dependency: Cairo
+### 5.3 External Dependency: Cairo
 
 Cairo is the critical rendering backend. It is:
 - ✅ Already cross-platform (Linux, Windows, macOS, Android, iOS)
@@ -155,7 +176,7 @@ Cairo will be compiled as a static library and linked into `libcobble_engine`.
 
 ---
 
-## 5. The C API Bridge (`cobble_engine_api.h`)
+## 6. The C API Bridge (`cobble_engine_api.h`)
 
 All communication between Flutter and C++ goes through a flat C API (no C++ name mangling):
 
@@ -217,9 +238,9 @@ void cobble_engine_add_page(void* engine);
 
 ---
 
-## 6. The Dart FFI Binding Layer
+## 7. The Dart FFI Binding Layer
 
-### 6.1 Loading the Native Library
+### 7.1 Loading the Native Library
 
 ```dart
 // lib/native/cobble_engine_bindings.dart
@@ -327,7 +348,7 @@ class CobbleEngineBindings {
 }
 ```
 
-### 6.2 The Canvas Widget
+### 7.2 The Canvas Widget
 
 ```dart
 // lib/ui/canvas/native_canvas_widget.dart
@@ -373,9 +394,9 @@ class _NativeCanvasWidgetState extends State<NativeCanvasWidget>
 
 ---
 
-## 7. Build System Configuration
+## 8. Build System Configuration
 
-### 7.1 Android (`android/CMakeLists.txt`)
+### 8.1 Android (`android/CMakeLists.txt`)
 
 ```cmake
 cmake_minimum_required(VERSION 3.18)
@@ -415,7 +436,7 @@ target_compile_options(cobble_engine PRIVATE
 )
 ```
 
-### 7.2 iOS (`ios/cobble_engine.podspec`)
+### 8.2 iOS (`ios/cobble_engine.podspec`)
 
 ```ruby
 Pod::Spec.new do |s|
@@ -431,9 +452,9 @@ end
 
 ---
 
-## 8. The Critical Algorithms Being Ported
+## 9. The Critical Algorithms Being Ported
 
-### 8.1 Pressure-Sensitive Contour Generation (`StrokeContour.cpp`)
+### 9.1 Pressure-Sensitive Contour Generation (`StrokeContour.cpp`)
 
 This is the crown jewel. Xournal++ does NOT simply draw a thick line. It generates a **filled polygon** whose width varies with pressure:
 
@@ -444,7 +465,7 @@ This is the crown jewel. Xournal++ does NOT simply draw a thick line. It generat
 
 This produces strokes that feel like real ink—organic, smooth, with natural tapering.
 
-### 8.2 Stroke Stabilizer Pipeline (`StrokeStabilizer.h`)
+### 9.2 Stroke Stabilizer Pipeline (`StrokeStabilizer.h`)
 
 Xournal++ offers 4 stabilizer algorithms that can be mixed:
 
@@ -455,7 +476,7 @@ Xournal++ offers 4 stabilizer algorithms that can be mixed:
 
 These can be combined into hybrids (e.g., `ArithmeticDeadzone`, `VelocityGaussianInertia`).
 
-### 8.3 Width Variation Decomposition (`StrokeHandler.cpp:73-118`)
+### 9.3 Width Variation Decomposition (`StrokeHandler.cpp:73-118`)
 
 When pressure changes dramatically between two consecutive points, Xournal++ subdivides the segment into smaller steps to prevent jarring width jumps:
 
@@ -471,7 +492,7 @@ This ensures buttery-smooth pressure transitions even on low-sample-rate devices
 
 ---
 
-## 9. Implementation Phases
+## 10. Implementation Phases
 
 ### Phase 1: Proof of Concept (2-3 weeks)
 - [ ] Extract core C++ files from Xournal++ into a standalone `engine/` directory
@@ -503,7 +524,7 @@ This ensures buttery-smooth pressure transitions even on low-sample-rate devices
 
 ---
 
-## 10. Risk Assessment
+## 11. Risk Assessment
 
 | Risk | Severity | Mitigation |
 |---|---|---|
@@ -515,7 +536,7 @@ This ensures buttery-smooth pressure transitions even on low-sample-rate devices
 
 ---
 
-## 11. Why This Approach Will Succeed
+## 12. Why This Approach Will Succeed
 
 1. **Battle-tested algorithms.** We are not inventing new stroke math. We are porting algorithms that have been refined by the open-source community for over a decade.
 2. **Surgical extraction.** The Xournal++ codebase has clean separation between model (`Stroke`, `Point`), view (`StrokeView`, `StrokeContour`), and control (`StrokeHandler`, `StrokeStabilizer`). This MVC architecture makes extraction feasible without touching the rest of the app.
